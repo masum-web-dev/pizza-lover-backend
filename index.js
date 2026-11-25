@@ -36,11 +36,22 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db('pizzaloverdb');
 
 const usersCollection = database.collection('users');
+const betterAuthUsersCollection = database.collection('user');
 const menuItemsCollection = database.collection('menuItems');
 const ordersCollection = database.collection('orders');
+const transactionsCollection = database.collection('transactions');
 
 function isValidObjectId(id) {
   return typeof id === 'string' && ObjectId.isValid(id);
+}
+
+function buildIdFilter(id) {
+  const cleanId = String(id).trim();
+  const conditions = [{ id: cleanId }];
+  if (ObjectId.isValid(cleanId)) {
+    conditions.push({ _id: new ObjectId(cleanId) });
+  }
+  return { $or: conditions };
 }
 
 function isItemApprovedAndActive(item) {
@@ -681,6 +692,60 @@ app.patch('/api/orders/:id/status', async (req, res) => {
   }
 });
 
+// GET /api/admin/overview
+app.get('/api/admin/overview', async (req, res) => {
+  try {
+    const [customUsers, authUsers, allMenuItems, allTransactions] =
+      await Promise.all([
+        usersCollection.find({}).toArray(),
+        betterAuthUsersCollection.find({}).toArray(),
+        menuItemsCollection.find({}).toArray(),
+        transactionsCollection.find({}).toArray(),
+      ]);
+
+    const mergedUsersMap = new Map();
+    for (const u of authUsers) {
+      const key = String(u.email || u._id).toLowerCase();
+      mergedUsersMap.set(key, {
+        role: String(u.role || 'customer').toLowerCase(),
+      });
+    }
+    for (const u of customUsers) {
+      const key = String(u.email || u._id).toLowerCase();
+      const prev = mergedUsersMap.get(key) || {};
+      mergedUsersMap.set(key, {
+        role: String(u.role || prev.role || 'customer').toLowerCase(),
+      });
+    }
+
+    const usersList = Array.from(mergedUsersMap.values());
+    const totalUsers = usersList.length;
+    const totalVendors = usersList.filter((u) => u.role === 'vendor').length;
+    const totalCustomers = usersList.filter(
+      (u) => u.role === 'customer'
+    ).length;
+
+    const totalMenuItems = allMenuItems.length;
+    const pendingMenuItems = allMenuItems.filter(
+      (item) => String(item.status || 'pending').toLowerCase() === 'pending'
+    ).length;
+
+    const totalTransactions = allTransactions.length;
+
+    res.status(200).json({
+      totalUsers,
+      totalVendors,
+      totalCustomers,
+      totalMenuItems,
+      pendingMenuItems,
+      totalTransactions,
+    });
+  } catch (err) {
+    console.error('Error fetching admin overview stats:', err);
+    res.status(500).json({ message: 'Failed to load admin overview stats.' });
+  }
+});
+
 // GET /api/admin/menu-items
 app.get('/api/admin/menu-items', async (req, res) => {
   try {
@@ -754,128 +819,7 @@ app.patch('/api/admin/menu-items/:id/status', async (req, res) => {
   }
 });
 
-// GET /api/admin/users
-app.get('/api/admin/users', async (req, res) => {
-  try {
-    const roleFilter = String(req.query.role || 'all').trim().toLowerCase();
-    const allUsers = await usersCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    const sanitized = allUsers.map((u) => ({
-      _id: u._id,
-      name: u.name || 'Unnamed User',
-      email: u.email || '',
-      role: String(u.role || 'customer').toLowerCase(),
-      businessName: u.businessName || '',
-      subscriptionPlan: String(u.subscriptionPlan || 'free').toLowerCase(),
-      isBlocked: Boolean(u.isBlocked),
-      createdAt: u.createdAt || null,
-    }));
-
-    const filtered =
-      roleFilter === 'all'
-        ? sanitized
-        : sanitized.filter((u) => u.role === roleFilter);
-
-    res.status(200).json(filtered);
-  } catch (err) {
-    console.error('Error fetching admin users:', err);
-    res.status(500).json({ message: 'Failed to load users.' });
-  }
-});
-
-// PATCH /api/admin/users/:id/block
-app.patch('/api/admin/users/:id/block', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { isBlocked } = req.body;
-
-    if (!isValidObjectId(id)) {
-      return res.status(400).json({ message: 'Invalid user ID.' });
-    }
-
-    if (typeof isBlocked !== 'boolean') {
-      return res
-        .status(400)
-        .json({ message: 'isBlocked must be true or false.' });
-    }
-
-    const existing = await usersCollection.findOne({ _id: new ObjectId(id) });
-    if (!existing) {
-      return res.status(404).json({ message: 'User not found.' });
-    }
-
-    if (String(existing.role || '').toLowerCase() === 'admin') {
-      return res
-        .status(403)
-        .json({ message: 'Admin accounts cannot be blocked.' });
-    }
-
-    await usersCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          isBlocked,
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    res.status(200).json({
-      message: isBlocked
-        ? 'User has been blocked.'
-        : 'User has been unblocked.',
-      isBlocked,
-    });
-  } catch (err) {
-    console.error('Error updating user block status:', err);
-    res.status(500).json({ message: 'Failed to update user status.' });
-  }
-});
-
-const transactionsCollection = database.collection('transactions');
-
-// GET /api/admin/overview — Real platform stats for Admin Overview
-app.get('/api/admin/overview', async (req, res) => {
-  try {
-    const [allUsers, allMenuItems, allTransactions] = await Promise.all([
-      usersCollection.find({}).toArray(),
-      menuItemsCollection.find({}).toArray(),
-      transactionsCollection.find({}).toArray(),
-    ]);
-
-    const totalUsers = allUsers.length;
-    const totalVendors = allUsers.filter(
-      (u) => String(u.role || '').toLowerCase() === 'vendor'
-    ).length;
-    const totalCustomers = allUsers.filter(
-      (u) => String(u.role || '').toLowerCase() === 'customer'
-    ).length;
-
-    const totalMenuItems = allMenuItems.length;
-    const pendingMenuItems = allMenuItems.filter(
-      (item) => String(item.status || 'pending').toLowerCase() === 'pending'
-    ).length;
-
-    const totalTransactions = allTransactions.length;
-
-    res.status(200).json({
-      totalUsers,
-      totalVendors,
-      totalCustomers,
-      totalMenuItems,
-      pendingMenuItems,
-      totalTransactions,
-    });
-  } catch (err) {
-    console.error('Error fetching admin overview stats:', err);
-    res.status(500).json({ message: 'Failed to load admin overview stats.' });
-  }
-});
-
-// DELETE /api/admin/menu-items/:id — Admin deletes inappropriate menu item
+// DELETE /api/admin/menu-items/:id
 app.delete('/api/admin/menu-items/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -887,7 +831,6 @@ app.delete('/api/admin/menu-items/:id', async (req, res) => {
     const existing = await menuItemsCollection.findOne({
       _id: new ObjectId(id),
     });
-
     if (!existing) {
       return res.status(404).json({ message: 'Menu item not found.' });
     }
@@ -901,7 +844,129 @@ app.delete('/api/admin/menu-items/:id', async (req, res) => {
   }
 });
 
-// GET /api/admin/transactions — Read-only transaction records for Admin
+// GET /api/admin/users
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const roleFilter = String(req.query.role || 'all').trim().toLowerCase();
+
+    const [customUsers, authUsers] = await Promise.all([
+      usersCollection.find({}).sort({ createdAt: -1 }).toArray(),
+      betterAuthUsersCollection.find({}).sort({ createdAt: -1 }).toArray(),
+    ]);
+
+    const mergedMap = new Map();
+
+    for (const u of authUsers) {
+      const key = String(u.email || u._id).toLowerCase();
+      mergedMap.set(key, {
+        _id: u._id,
+        id: u.id || String(u._id),
+        name: u.name || 'Unnamed User',
+        email: u.email || '',
+        role: String(u.role || 'customer').toLowerCase(),
+        businessName: u.businessName || '',
+        subscriptionPlan: String(u.subscriptionPlan || 'free').toLowerCase(),
+        isBlocked: Boolean(u.isBlocked),
+        createdAt: u.createdAt || null,
+      });
+    }
+
+    for (const u of customUsers) {
+      const key = String(u.email || u._id).toLowerCase();
+      const prev = mergedMap.get(key) || {};
+      mergedMap.set(key, {
+        ...prev,
+        _id: u._id || prev._id,
+        id: u.id || prev.id || String(u._id || ''),
+        name: u.name || prev.name || 'Unnamed User',
+        email: u.email || prev.email || '',
+        role: String(u.role || prev.role || 'customer').toLowerCase(),
+        businessName: u.businessName || prev.businessName || '',
+        subscriptionPlan: String(
+          u.subscriptionPlan || prev.subscriptionPlan || 'free'
+        ).toLowerCase(),
+        isBlocked:
+          u.isBlocked !== undefined
+            ? Boolean(u.isBlocked)
+            : Boolean(prev.isBlocked),
+        createdAt: u.createdAt || prev.createdAt || null,
+      });
+    }
+
+    const allSanitized = Array.from(mergedMap.values());
+
+    const filtered =
+      roleFilter === 'all'
+        ? allSanitized
+        : allSanitized.filter((u) => u.role === roleFilter);
+
+    res.status(200).json(filtered);
+  } catch (err) {
+    console.error('Error fetching admin users:', err);
+    res.status(500).json({ message: 'Failed to load users.' });
+  }
+});
+
+// PATCH /api/admin/users/:id/block
+app.patch('/api/admin/users/:id/block', async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    const { isBlocked } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ message: 'Invalid user ID.' });
+    }
+
+    if (typeof isBlocked !== 'boolean') {
+      return res
+        .status(400)
+        .json({ message: 'isBlocked must be true or false.' });
+    }
+
+    const filter = buildIdFilter(id);
+    const [customUser, authUser] = await Promise.all([
+      usersCollection.findOne(filter),
+      betterAuthUsersCollection.findOne(filter),
+    ]);
+
+    const existing = customUser || authUser;
+    if (!existing) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (String(existing.role || '').toLowerCase() === 'admin') {
+      return res
+        .status(403)
+        .json({ message: 'Admin accounts cannot be blocked.' });
+    }
+
+    const updateDoc = {
+      $set: {
+        isBlocked,
+        updatedAt: new Date(),
+      },
+    };
+
+    if (customUser) {
+      await usersCollection.updateOne(buildIdFilter(String(customUser._id)), updateDoc);
+    }
+    if (authUser) {
+      await betterAuthUsersCollection.updateOne(buildIdFilter(String(authUser._id)), updateDoc);
+    }
+
+    res.status(200).json({
+      message: isBlocked
+        ? 'User has been blocked.'
+        : 'User has been unblocked.',
+      isBlocked,
+    });
+  } catch (err) {
+    console.error('Error updating user block status:', err);
+    res.status(500).json({ message: 'Failed to update user status.' });
+  }
+});
+
+// GET /api/admin/transactions
 app.get('/api/admin/transactions', async (req, res) => {
   try {
     const txns = await transactionsCollection
@@ -913,6 +978,153 @@ app.get('/api/admin/transactions', async (req, res) => {
   } catch (err) {
     console.error('Error fetching admin transactions:', err);
     res.status(500).json({ message: 'Failed to load transactions.' });
+  }
+});
+
+// GET /api/admin/orders
+app.get('/api/admin/orders', async (req, res) => {
+  try {
+    const statusFilter = String(req.query.status || 'all').trim().toLowerCase();
+    const allOrders = await ordersCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const totalRevenue = allOrders.reduce((sum, ord) => {
+      const st = String(ord.status || 'pending').toLowerCase();
+      if (st === 'accepted') {
+        return sum + Number(ord.price || 0);
+      }
+      return sum;
+    }, 0);
+
+    const filtered =
+      statusFilter === 'all'
+        ? allOrders
+        : allOrders.filter(
+            (ord) =>
+              String(ord.status || 'pending').toLowerCase() === statusFilter
+          );
+
+    res.status(200).json({
+      orders: filtered,
+      stats: {
+        totalOrders: allOrders.length,
+        acceptedOrders: allOrders.filter(
+          (o) => String(o.status || '').toLowerCase() === 'accepted'
+        ).length,
+        pendingOrders: allOrders.filter(
+          (o) => String(o.status || 'pending').toLowerCase() === 'pending'
+        ).length,
+        totalRevenue,
+      },
+    });
+  } catch (err) {
+    console.error('Error fetching admin orders:', err);
+    res.status(500).json({ message: 'Failed to load orders for admin.' });
+  }
+});
+
+// PATCH /api/vendor/profile
+app.patch('/api/vendor/profile', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const businessName =
+      typeof req.body?.businessName === 'string'
+        ? req.body.businessName.trim()
+        : '';
+
+    if (!userId && !email) {
+      return res
+        .status(400)
+        .json({ message: 'userId or email is required to update profile.' });
+    }
+
+    if (name && name.length < 2) {
+      return res
+        .status(400)
+        .json({ message: 'Vendor name must be at least 2 characters.' });
+    }
+
+    const filterConditions = [];
+    if (userId) {
+      filterConditions.push({ id: userId });
+      if (isValidObjectId(userId)) {
+        filterConditions.push({ _id: new ObjectId(userId) });
+      }
+    }
+    if (email) {
+      filterConditions.push({ email });
+    }
+
+    const queryFilter =
+      filterConditions.length === 1
+        ? filterConditions[0]
+        : { $or: filterConditions };
+
+    const [customUser, authUser] = await Promise.all([
+      usersCollection.findOne(queryFilter),
+      betterAuthUsersCollection.findOne(queryFilter),
+    ]);
+
+    if (!customUser && !authUser) {
+      return res.status(404).json({ message: 'User profile not found.' });
+    }
+
+    const updateFields = {
+      updatedAt: new Date(),
+    };
+    if (name) {
+      updateFields.name = name;
+    }
+    if (typeof req.body?.businessName === 'string') {
+      updateFields.businessName = businessName;
+    }
+
+    if (customUser) {
+      await usersCollection.updateOne(
+        { _id: customUser._id },
+        { $set: updateFields }
+      );
+    } else if (authUser) {
+      // usersCollection-এ রেকর্ড না থাকলে synced রেকর্ড তৈরি করা
+      await usersCollection.insertOne({
+        id: authUser.id || String(authUser._id),
+        name: name || authUser.name || 'Vendor',
+        email: authUser.email || email,
+        role: String(authUser.role || 'vendor').toLowerCase(),
+        businessName: businessName || authUser.businessName || '',
+        subscriptionPlan: String(
+          authUser.subscriptionPlan || 'free'
+        ).toLowerCase(),
+        isBlocked: Boolean(authUser.isBlocked),
+        createdAt: authUser.createdAt || new Date(),
+        ...updateFields,
+      });
+    }
+
+    if (authUser) {
+      await betterAuthUsersCollection.updateOne(
+        { _id: authUser._id },
+        { $set: updateFields }
+      );
+    }
+
+    const updatedUser =
+      (await usersCollection.findOne(queryFilter)) ||
+      (await betterAuthUsersCollection.findOne(queryFilter));
+
+    return res.status(200).json({
+      message: 'Profile updated successfully.',
+      user: updatedUser,
+    });
+  } catch (err) {
+    console.error('Error updating vendor profile:', err);
+    return res
+      .status(500)
+      .json({ message: 'Failed to update vendor profile.' });
   }
 });
 
