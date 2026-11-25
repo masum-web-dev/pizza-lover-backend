@@ -592,6 +592,87 @@ app.patch('/api/admin/menu-items/:id/status', async (req, res) => {
   }
 });
 
+// GET /api/admin/users
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const roleFilter = String(req.query.role || 'all').trim().toLowerCase();
+    const allUsers = await usersCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const sanitized = allUsers.map((u) => ({
+      _id: u._id,
+      name: u.name || 'Unnamed User',
+      email: u.email || '',
+      role: String(u.role || 'customer').toLowerCase(),
+      businessName: u.businessName || '',
+      subscriptionPlan: String(u.subscriptionPlan || 'free').toLowerCase(),
+      isBlocked: Boolean(u.isBlocked),
+      createdAt: u.createdAt || null,
+    }));
+
+    const filtered =
+      roleFilter === 'all'
+        ? sanitized
+        : sanitized.filter((u) => u.role === roleFilter);
+
+    res.status(200).json(filtered);
+  } catch (err) {
+    console.error('Error fetching admin users:', err);
+    res.status(500).json({ message: 'Failed to load users.' });
+  }
+});
+
+// PATCH /api/admin/users/:id/block
+app.patch('/api/admin/users/:id/block', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isBlocked } = req.body;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid user ID.' });
+    }
+
+    if (typeof isBlocked !== 'boolean') {
+      return res
+        .status(400)
+        .json({ message: 'isBlocked must be true or false.' });
+    }
+
+    const existing = await usersCollection.findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (String(existing.role || '').toLowerCase() === 'admin') {
+      return res
+        .status(403)
+        .json({ message: 'Admin accounts cannot be blocked.' });
+    }
+
+    await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          isBlocked,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      message: isBlocked
+        ? 'User has been blocked.'
+        : 'User has been unblocked.',
+      isBlocked,
+    });
+  } catch (err) {
+    console.error('Error updating user block status:', err);
+    res.status(500).json({ message: 'Failed to update user status.' });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
