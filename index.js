@@ -439,6 +439,168 @@ app.delete('/api/vendor/menu-items/:id', async (req, res) => {
   }
 });
 
+// POST /api/orders
+app.post('/api/orders', async (req, res) => {
+  try {
+    const {
+      itemId,
+      customerId,
+      customerName,
+      customerEmail,
+      deliveryDate,
+      deliveryAddress,
+      message,
+    } = req.body;
+
+    if (!customerId || !String(customerId).trim()) {
+      return res
+        .status(401)
+        .json({ message: 'Customer login is required to place an order.' });
+    }
+
+    if (!itemId || !isValidObjectId(String(itemId).trim())) {
+      return res.status(400).json({ message: 'Valid menu item ID is required.' });
+    }
+
+    if (!deliveryDate || !String(deliveryDate).trim()) {
+      return res.status(400).json({ message: 'Delivery date is required.' });
+    }
+
+    if (!deliveryAddress || String(deliveryAddress).trim().length < 5) {
+      return res
+        .status(400)
+        .json({ message: 'Valid delivery address is required.' });
+    }
+
+    const menuItem = await menuItemsCollection.findOne({
+      _id: new ObjectId(String(itemId).trim()),
+    });
+
+    if (!menuItem) {
+      return res.status(404).json({ message: 'Menu item not found.' });
+    }
+
+    const status = String(menuItem.status || 'approved').toLowerCase();
+    const isActive =
+      menuItem.isActive === undefined ? true : Boolean(menuItem.isActive);
+    if (status !== 'approved' || !isActive) {
+      return res
+        .status(400)
+        .json({ message: 'This menu item is currently unavailable for order.' });
+    }
+
+    const newOrder = {
+      itemId: String(menuItem._id),
+      itemName: menuItem.itemName || menuItem.name || 'Pizza Item',
+      itemImage:
+        (Array.isArray(menuItem.images) && menuItem.images[0]) ||
+        menuItem.image ||
+        '/Logo.jpg',
+      price: Number(menuItem.price || 0),
+      vendorId: String(menuItem.vendorId || ''),
+      vendorName:
+        menuItem.businessName || menuItem.vendorName || 'PizzaHub Kitchen',
+      customerId: String(customerId).trim(),
+      customerName: String(customerName || 'Customer').trim(),
+      customerEmail: String(customerEmail || '').trim(),
+      deliveryDate: String(deliveryDate).trim(),
+      deliveryAddress: String(deliveryAddress).trim(),
+      message: String(message || '').trim(),
+      status: 'pending',
+      createdAt: new Date(),
+    };
+
+    const result = await ordersCollection.insertOne(newOrder);
+
+    res.status(201).json({
+      message: 'Order placed successfully!',
+      id: result.insertedId,
+      order: {
+        ...newOrder,
+        _id: result.insertedId,
+      },
+    });
+  } catch (err) {
+    console.error('Error creating order:', err);
+    res.status(500).json({ message: 'Failed to place order.' });
+  }
+});
+
+// GET /api/orders/customer
+app.get('/api/orders/customer', async (req, res) => {
+  try {
+    const customerId = String(req.query.customerId || '').trim();
+
+    if (!customerId) {
+      return res.status(401).json({ message: 'customerId is required.' });
+    }
+
+    const orders = await ordersCollection
+      .find({ customerId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(orders);
+  } catch (err) {
+    console.error('Error fetching customer orders:', err);
+    res.status(500).json({ message: 'Failed to load your orders.' });
+  }
+});
+
+// PATCH /api/orders/:id/cancel
+app.patch('/api/orders/:id/cancel', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const customerId = String(req.body?.customerId || '').trim();
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid order ID.' });
+    }
+
+    if (!customerId) {
+      return res
+        .status(401)
+        .json({ message: 'Customer authentication required.' });
+    }
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(id) });
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found.' });
+    }
+
+    if (String(order.customerId) !== customerId) {
+      return res
+        .status(403)
+        .json({ message: 'You can only cancel your own orders.' });
+    }
+
+    const currentStatus = String(order.status || 'pending').toLowerCase();
+    if (currentStatus !== 'pending') {
+      return res.status(400).json({
+        message: `Cannot cancel an order that is already "${currentStatus}".`,
+      });
+    }
+
+    await ordersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: 'cancelled',
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.status(200).json({
+      message: 'Order cancelled successfully.',
+      status: 'cancelled',
+    });
+  } catch (err) {
+    console.error('Error cancelling order:', err);
+    res.status(500).json({ message: 'Failed to cancel order.' });
+  }
+});
+
 // GET /api/orders/vendor
 app.get('/api/orders/vendor', async (req, res) => {
   try {
@@ -670,6 +832,87 @@ app.patch('/api/admin/users/:id/block', async (req, res) => {
   } catch (err) {
     console.error('Error updating user block status:', err);
     res.status(500).json({ message: 'Failed to update user status.' });
+  }
+});
+
+const transactionsCollection = database.collection('transactions');
+
+// GET /api/admin/overview — Real platform stats for Admin Overview
+app.get('/api/admin/overview', async (req, res) => {
+  try {
+    const [allUsers, allMenuItems, allTransactions] = await Promise.all([
+      usersCollection.find({}).toArray(),
+      menuItemsCollection.find({}).toArray(),
+      transactionsCollection.find({}).toArray(),
+    ]);
+
+    const totalUsers = allUsers.length;
+    const totalVendors = allUsers.filter(
+      (u) => String(u.role || '').toLowerCase() === 'vendor'
+    ).length;
+    const totalCustomers = allUsers.filter(
+      (u) => String(u.role || '').toLowerCase() === 'customer'
+    ).length;
+
+    const totalMenuItems = allMenuItems.length;
+    const pendingMenuItems = allMenuItems.filter(
+      (item) => String(item.status || 'pending').toLowerCase() === 'pending'
+    ).length;
+
+    const totalTransactions = allTransactions.length;
+
+    res.status(200).json({
+      totalUsers,
+      totalVendors,
+      totalCustomers,
+      totalMenuItems,
+      pendingMenuItems,
+      totalTransactions,
+    });
+  } catch (err) {
+    console.error('Error fetching admin overview stats:', err);
+    res.status(500).json({ message: 'Failed to load admin overview stats.' });
+  }
+});
+
+// DELETE /api/admin/menu-items/:id — Admin deletes inappropriate menu item
+app.delete('/api/admin/menu-items/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ message: 'Invalid menu item ID.' });
+    }
+
+    const existing = await menuItemsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!existing) {
+      return res.status(404).json({ message: 'Menu item not found.' });
+    }
+
+    await menuItemsCollection.deleteOne({ _id: new ObjectId(id) });
+
+    res.status(200).json({ message: 'Menu item deleted by admin.' });
+  } catch (err) {
+    console.error('Error deleting menu item as admin:', err);
+    res.status(500).json({ message: 'Failed to delete menu item.' });
+  }
+});
+
+// GET /api/admin/transactions — Read-only transaction records for Admin
+app.get('/api/admin/transactions', async (req, res) => {
+  try {
+    const txns = await transactionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(txns);
+  } catch (err) {
+    console.error('Error fetching admin transactions:', err);
+    res.status(500).json({ message: 'Failed to load transactions.' });
   }
 });
 
