@@ -2,17 +2,183 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
 
 const app = express();
 const port = process.env.PORT || process.env.port || 8000;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-app.use(express.json());
+// Stripe Webhook — MUST be before express.json()
+app.post(
+  '/api/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+      if (webhookSecret) {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+      } else {
+        event = JSON.parse(req.body.toString('utf8'));
+      }
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const vendorId = String(session.metadata?.vendorId || '').trim();
+      const vendorEmail = String(
+        session.metadata?.vendorEmail || session.customer_email || ''
+      )
+        .trim()
+        .toLowerCase();
+      const vendorName = String(session.metadata?.vendorName || 'Vendor').trim();
+      const plan = String(session.metadata?.plan || 'premium').toLowerCase();
+
+      const amountPaid =
+        typeof session.amount_total === 'number'
+          ? session.amount_total / 100
+          : 19.0;
+      const currency = String(session.currency || 'usd').toUpperCase();
+
+      try {
+        const filterConditions = [];
+        if (vendorId) {
+          filterConditions.push({ id: vendorId });
+          if (isValidObjectId(vendorId)) {
+            filterConditions.push({ _id: new ObjectId(vendorId) });
+          }
+        }
+        if (vendorEmail) {
+          filterConditions.push({ email: vendorEmail });
+        }
+
+        if (filterConditions.length > 0) {
+          const userFilter =
+            filterConditions.length === 1
+              ? filterConditions[0]
+              : { $or: filterConditions };
+
+          const updatePlanDoc = {
+            $set: {
+              subscriptionPlan: plan,
+              updatedAt: new Date(),
+            },
+          };
+
+          await Promise.all([
+            usersCollection.updateMany(userFilter, updatePlanDoc),
+            betterAuthUsersCollection.updateMany(userFilter, updatePlanDoc),
+          ]);
+        }
+
+        const existingTxn = await transactionsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+        if (!existingTxn) {
+          await transactionsCollection.insertOne({
+            vendorId,
+            vendorEmail,
+            vendorName,
+            plan,
+            amount: amountPaid,
+            currency,
+            status: 'paid',
+            stripeSessionId: session.id,
+            createdAt: new Date(),
+          });
+        }
+      } catch (dbErr) {
+        console.error('Error processing checkout.session.completed:', dbErr);
+        return res.status(500).json({ message: 'Webhook DB update failed' });
+      }
+    }
+
+    return res.status(200).json({ received: true });
+  }
+);
 app.use(
   cors({
     origin: process.env.CLIENT_URL || 'http://localhost:3000',
     credentials: true,
   })
 );
+
+app.use(express.json());
+// POST /api/stripe/create-checkout-session
+
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  try {
+    const secretKey = String(process.env.STRIPE_SECRET_KEY || '').trim();
+    if (!secretKey) {
+      return res.status(500).json({
+        message: 'STRIPE_SECRET_KEY is missing in backend .env',
+      });
+    }
+
+    const stripeClient = new Stripe(secretKey);
+
+    const vendorId = String(req.body?.vendorId || '').trim();
+    const vendorEmail = String(req.body?.vendorEmail || '')
+      .trim()
+      .toLowerCase();
+    const vendorName = String(req.body?.vendorName || 'Vendor').trim();
+
+    if (!vendorId && !vendorEmail) {
+      return res
+        .status(400)
+        .json({ message: 'vendorId or vendorEmail is required.' });
+    }
+
+    const clientUrl = String(
+      process.env.CLIENT_URL || 'http://localhost:3000'
+    ).trim();
+
+    const session = await stripeClient.checkout.sessions.create({
+      mode: 'payment',
+      allowed_payment_method_types: ['card'],
+      customer_email: vendorEmail || undefined,
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: 'PizzaLovers Vendor Premium Plan',
+              description:
+                'Unlimited active menu items and priority kitchen listing.',
+            },
+            unit_amount: 1900, // $19.00
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        vendorId,
+        vendorEmail,
+        vendorName,
+        plan: 'premium',
+      },
+      success_url: `${clientUrl}/dashboard/vendor/profile-settings?subscription=success`,
+      cancel_url: `${clientUrl}/dashboard/vendor/profile-settings?subscription=cancelled`,
+    });
+
+    return res.status(200).json({
+      url: session.url,
+      sessionId: session.id,
+    });
+  } catch (err) {
+    console.error('Error creating Stripe checkout session:', err);
+    return res.status(500).json({
+      message: err?.message || 'Failed to initialize Stripe checkout.',
+    });
+  }
+});
+
 
 const mongoUri =
   process.env.MONGODB_URI ||
@@ -151,6 +317,214 @@ app.get('/api/pizzas/:id', async (req, res) => {
 });
 
 // POST /api/pizzas
+// app.post('/api/pizzas', async (req, res) => {
+//   try {
+//     const {
+//       itemName,
+//       name,
+//       category,
+//       description,
+//       price,
+//       location,
+//       images,
+//       image,
+//       vendorId,
+//       vendorEmail,
+//       vendorName,
+//       businessName,
+//     } = req.body;
+
+//     const title = String(itemName || name || '').trim();
+//     const numericPrice = Number(price);
+//     const resolvedImages =
+//       Array.isArray(images) && images.length > 0
+//         ? images
+//         : image
+//         ? [String(image).trim()]
+//         : [];
+
+//     if (!vendorId || !String(vendorId).trim()) {
+//       return res.status(401).json({ message: 'Vendor authentication required.' });
+//     }
+
+//     if (!title || title.length < 2) {
+//       return res.status(400).json({ message: 'Item name is required.' });
+//     }
+
+//     if (!category || !String(category).trim()) {
+//       return res.status(400).json({ message: 'Category is required.' });
+//     }
+
+//     if (!description || String(description).trim().length < 10) {
+//       return res
+//         .status(400)
+//         .json({ message: 'Description must be at least 10 characters.' });
+//     }
+
+//     if (Number.isNaN(numericPrice) || numericPrice <= 0) {
+//       return res.status(400).json({ message: 'Valid price is required.' });
+//     }
+
+//     if (!location || !String(location).trim()) {
+//       return res.status(400).json({ message: 'Location is required.' });
+//     }
+
+//     if (resolvedImages.length === 0) {
+//       return res
+//         .status(400)
+//         .json({ message: 'At least one item image is required.' });
+//     }
+
+//     const vendorIdStr = String(vendorId).trim();
+//     const vendorEmailStr = String(vendorEmail || '').trim().toLowerCase();
+
+//     const vendorFilterConditions = [{ id: vendorIdStr }];
+//     if (isValidObjectId(vendorIdStr)) {
+//       vendorFilterConditions.push({ _id: new ObjectId(vendorIdStr) });
+//     }
+//     if (vendorEmailStr) {
+//       vendorFilterConditions.push({ email: vendorEmailStr });
+//     }
+
+//     const vendorQuery =
+//       vendorFilterConditions.length === 1
+//         ? vendorFilterConditions[0]
+//         : { $or: vendorFilterConditions };
+
+//     const vendorUser =
+//       (await usersCollection.findOne(vendorQuery)) ||
+//       (await betterAuthUsersCollection.findOne(vendorQuery));
+
+//     if (vendorUser?.isBlocked) {
+//       return res
+//         .status(403)
+//         .json({ message: 'Blocked vendors cannot publish menu items.' });
+//     }
+
+//     const effectiveRole = String(vendorUser?.role || 'vendor').toLowerCase();
+//     if (effectiveRole !== 'vendor' && effectiveRole !== 'admin') {
+//       return res
+//         .status(403)
+//         .json({ message: 'Only vendors can add menu items.' });
+//     }
+
+//     const plan = String(
+//       vendorUser?.subscriptionPlan || vendorUser?.plan || 'free'
+//     ).toLowerCase();
+
+//     if (plan !== 'premium') {
+//       const existingVendorItems = await menuItemsCollection
+//         .find({ vendorId: vendorIdStr })
+//         .toArray();
+
+//       const activeCount = existingVendorItems.filter((item) => {
+//         const active = item.isActive === undefined ? true : Boolean(item.isActive);
+//         const status = String(item.status || '').toLowerCase();
+//         return active && status !== 'rejected';
+//       }).length;
+
+//       if (activeCount >= 3) {
+//         return res.status(403).json({
+//           message:
+//             'Free plan allows a maximum of 3 active menu items. Upgrade to Premium for unlimited items.',
+//         });
+//       }
+//     }
+
+//     const newMenuItem = {
+//       vendorId: vendorIdStr,
+//       vendorEmail: vendorEmailStr || vendorUser?.email || '',
+//       vendorName: vendorName || vendorUser?.name || 'Vendor',
+//       businessName:
+//         businessName ||
+//         vendorUser?.businessName ||
+//         vendorUser?.name ||
+//         'PizzaHub Kitchen',
+//       itemName: title,
+//       category: String(category).trim(),
+//       description: String(description).trim(),
+//       price: numericPrice,
+//       location: String(location).trim(),
+//       images: resolvedImages,
+//       image: resolvedImages[0],
+//       status: 'pending',
+//       isActive: true,
+//       createdAt: new Date(),
+//     };
+
+//     const result = await menuItemsCollection.insertOne(newMenuItem);
+
+//     return res.status(201).json({
+//       message: 'Menu item created with status Pending.',
+//       id: result.insertedId,
+//       item: {
+//         ...newMenuItem,
+//         _id: result.insertedId,
+//       },
+//     });
+//   } catch (err) {
+//     console.error('Error creating menu item:', err);
+//     return res.status(500).json({ message: 'Failed to create menu item.' });
+//   }
+// });
+  
+
+//     const newMenuItem = {
+//       vendorId: vendorIdStr,
+//       vendorName: vendorName || vendorUser?.name || 'Vendor',
+//       businessName:
+//         businessName ||
+//         vendorUser?.businessName ||
+//         vendorUser?.name ||
+//         'PizzaHub Kitchen',
+//       itemName: title,
+//       category: String(category).trim(),
+//       description: String(description).trim(),
+//       price: numericPrice,
+//       location: String(location).trim(),
+//       images: resolvedImages,
+//       image: resolvedImages[0],
+//       status: 'pending',
+//       isActive: true,
+//       createdAt: new Date(),
+//     };
+
+//     const result = await menuItemsCollection.insertOne(newMenuItem);
+
+//     res.status(201).json({
+//       message: 'Menu item created with status Pending.',
+//       id: result.insertedId,
+//       item: {
+//         ...newMenuItem,
+//         _id: result.insertedId,
+//       },
+//     });
+//   } catch (err) {
+//     console.error('Error creating menu item:', err);
+//     res.status(500).json({ message: 'Failed to create menu item.' });
+//   }
+// });
+
+// // GET /api/vendor/menu-items
+// app.get('/api/vendor/menu-items', async (req, res) => {
+//   try {
+//     const vendorId = String(req.query.vendorId || '').trim();
+
+//     if (!vendorId) {
+//       return res.status(401).json({ message: 'vendorId is required.' });
+//     }
+
+//     const items = await menuItemsCollection
+//       .find({ vendorId })
+//       .sort({ createdAt: -1 })
+//       .toArray();
+
+//     res.status(200).json(items);
+//   } catch (err) {
+//     console.error('Error fetching vendor menu items:', err);
+//     res.status(500).json({ message: 'Failed to load vendor menu items.' });
+//   }
+// });
 app.post('/api/pizzas', async (req, res) => {
   try {
     const {
@@ -163,6 +537,7 @@ app.post('/api/pizzas', async (req, res) => {
       images,
       image,
       vendorId,
+      vendorEmail,
       vendorName,
       businessName,
     } = req.body;
@@ -209,13 +584,24 @@ app.post('/api/pizzas', async (req, res) => {
     }
 
     const vendorIdStr = String(vendorId).trim();
+    const vendorEmailStr = String(vendorEmail || '').trim().toLowerCase();
 
-    let vendorUser = null;
+    const vendorFilterConditions = [{ id: vendorIdStr }];
     if (isValidObjectId(vendorIdStr)) {
-      vendorUser = await usersCollection.findOne({
-        _id: new ObjectId(vendorIdStr),
-      });
+      vendorFilterConditions.push({ _id: new ObjectId(vendorIdStr) });
     }
+    if (vendorEmailStr) {
+      vendorFilterConditions.push({ email: vendorEmailStr });
+    }
+
+    const vendorQuery =
+      vendorFilterConditions.length === 1
+        ? vendorFilterConditions[0]
+        : { $or: vendorFilterConditions };
+
+    const vendorUser =
+      (await usersCollection.findOne(vendorQuery)) ||
+      (await betterAuthUsersCollection.findOne(vendorQuery));
 
     if (vendorUser?.isBlocked) {
       return res
@@ -230,7 +616,10 @@ app.post('/api/pizzas', async (req, res) => {
         .json({ message: 'Only vendors can add menu items.' });
     }
 
-    const plan = String(vendorUser?.subscriptionPlan || 'free').toLowerCase();
+    const plan = String(
+      vendorUser?.subscriptionPlan || vendorUser?.plan || 'free'
+    ).toLowerCase();
+
     if (plan !== 'premium') {
       const existingVendorItems = await menuItemsCollection
         .find({ vendorId: vendorIdStr })
@@ -252,6 +641,7 @@ app.post('/api/pizzas', async (req, res) => {
 
     const newMenuItem = {
       vendorId: vendorIdStr,
+      vendorEmail: vendorEmailStr || vendorUser?.email || '',
       vendorName: vendorName || vendorUser?.name || 'Vendor',
       businessName:
         businessName ||
@@ -272,7 +662,7 @@ app.post('/api/pizzas', async (req, res) => {
 
     const result = await menuItemsCollection.insertOne(newMenuItem);
 
-    res.status(201).json({
+    return res.status(201).json({
       message: 'Menu item created with status Pending.',
       id: result.insertedId,
       item: {
@@ -282,7 +672,7 @@ app.post('/api/pizzas', async (req, res) => {
     });
   } catch (err) {
     console.error('Error creating menu item:', err);
-    res.status(500).json({ message: 'Failed to create menu item.' });
+    return res.status(500).json({ message: 'Failed to create menu item.' });
   }
 });
 
@@ -306,6 +696,7 @@ app.get('/api/vendor/menu-items', async (req, res) => {
     res.status(500).json({ message: 'Failed to load vendor menu items.' });
   }
 });
+
 
 // PATCH /api/vendor/menu-items/:id
 app.patch('/api/vendor/menu-items/:id', async (req, res) => {
@@ -1125,6 +1516,51 @@ app.patch('/api/vendor/profile', async (req, res) => {
     return res
       .status(500)
       .json({ message: 'Failed to update vendor profile.' });
+  }
+});
+
+// GET /api/vendor/subscription-status
+app.get('/api/vendor/subscription-status', async (req, res) => {
+  try {
+    const userId = String(req.query.userId || '').trim();
+    const email = String(req.query.email || '').trim().toLowerCase();
+
+    if (!userId && !email) {
+      return res.status(400).json({ message: 'userId or email is required.' });
+    }
+
+    const filterConditions = [];
+    if (userId) {
+      filterConditions.push({ id: userId });
+      if (isValidObjectId(userId)) {
+        filterConditions.push({ _id: new ObjectId(userId) });
+      }
+    }
+    if (email) {
+      filterConditions.push({ email });
+    }
+
+    const queryFilter =
+      filterConditions.length === 1
+        ? filterConditions[0]
+        : { $or: filterConditions };
+
+    const userDoc =
+      (await usersCollection.findOne(queryFilter)) ||
+      (await betterAuthUsersCollection.findOne(queryFilter));
+
+    const plan = String(
+      userDoc?.subscriptionPlan || userDoc?.plan || 'free'
+    ).toLowerCase();
+
+    return res.status(200).json({
+      subscriptionPlan: plan,
+      businessName: userDoc?.businessName || '',
+      name: userDoc?.name || '',
+    });
+  } catch (err) {
+    console.error('Error fetching subscription status:', err);
+    return res.status(500).json({ message: 'Failed to load plan status.' });
   }
 });
 
